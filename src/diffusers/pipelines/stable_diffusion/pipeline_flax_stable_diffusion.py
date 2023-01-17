@@ -20,6 +20,11 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
+
+import contextlib
+import time
+import alpa
+
 from flax.core.frozen_dict import FrozenDict
 from flax.jax_utils import unreplicate
 from flax.training.common_utils import shard
@@ -38,6 +43,14 @@ from ...utils import deprecate, logging
 from ..pipeline_flax_utils import FlaxDiffusionPipeline
 from . import FlaxStableDiffusionPipelineOutput
 from .safety_checker_flax import FlaxStableDiffusionSafetyChecker
+
+@contextlib.contextmanager
+def timer(name: str):
+    begin = time.time_ns()
+    try:
+        yield begin
+    finally:
+        print(f'Timer {name}[ms] {(time.time_ns() - begin) / int(1e6)}')    
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -180,6 +193,35 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
 
         return images, has_nsfw_concepts
 
+    def loop_body(self, step, args):
+        latents, scheduler_state, params, context, guidance_scale = args
+        # For classifier free guidance, we need to do two forward passes.
+        # Here we concatenate the unconditional and text embeddings into a single batch
+        # to avoid doing two forward passes
+        # latents.shape: (1, 4, 64, 64)
+        latents_input = jnp.concatenate([latents] * 2)
+        # latents_input.shape: (2, 4, 64, 64)
+
+        t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
+        timestep = jnp.broadcast_to(t, latents_input.shape[0])
+
+        latents_input = self.scheduler.scale_model_input(scheduler_state, latents_input, t)
+
+        # predict the noise residual
+        noise_pred = self.unet.apply(
+            {"params": params["unet"]},
+            jnp.array(latents_input),
+            jnp.array(timestep, dtype=jnp.int32),
+            encoder_hidden_states=context,
+        ).sample
+        # perform guidance
+        noise_pred_uncond, noise_prediction_text = jnp.split(noise_pred, 2, axis=0)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
+
+        # compute the previous noisy sample x_t -> x_t-1
+        latents, scheduler_state = self.scheduler.step(scheduler_state, noise_pred, t, latents).to_tuple()
+        return latents, scheduler_state, params, context, guidance_scale
+
     def _generate(
         self,
         prompt_ids: jnp.array,
@@ -191,86 +233,124 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
         guidance_scale: float,
         latents: Optional[jnp.array] = None,
         neg_prompt_ids: Optional[jnp.array] = None,
+        ray_enabled: bool = False,
     ):
-        if height % 8 != 0 or width % 8 != 0:
-            raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
+        def _wrap_outside_a_text_encoder(prompt_ids):
+            state = {
+                "text_encoder": params["text_encoder"]
+            }
+            batch = {
+                "prompt_ids": prompt_ids
+            }
+            static_args = {
+                "pipeline": self
+            }
+            return jnp.array(_outside_a_text_encoder(state, batch, static_args))
 
-        # get prompt text embeddings
-        text_embeddings = self.text_encoder(prompt_ids, params=params["text_encoder"])[0]
+        def _wrap_outside_a_loop_body(step, args):
+            latents, scheduler_state, params, context, guidance_scale = args
+            state = {
+                "step": step,
+                "unet": params["unet"],
+                "scheduler_state": scheduler_state,
+                "context": context,
+                "guidance_scale": guidance_scale
+            }
+            batch = {
+                "latents":latents
+            }
+            static_args = {
+                "pipeline": self,
+            }
+            ret = _outside_a_loop_body(state, batch, static_args)
+            
+            return ret
 
-        # TODO: currently it is assumed `do_classifier_free_guidance = guidance_scale > 1.0`
-        # implement this conditional `do_classifier_free_guidance = guidance_scale > 1.0`
-        batch_size = prompt_ids.shape[0]
+        def _wrap_outside_a_vae_apply(latents):
+            state = {
+                "vae": params["vae"],
+            }
+            batch = {
+                "latents": latents
+            }
+            static_args = {
+                "pipeline": self
+            }
+            return _outside_a_vae_apply(state, batch, static_args)
 
-        max_length = prompt_ids.shape[-1]
+        with timer("before main loop"):
+            if height % 8 != 0 or width % 8 != 0:
+                raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
-        if neg_prompt_ids is None:
-            uncond_input = self.tokenizer(
-                [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="np"
-            ).input_ids
-        else:
-            uncond_input = neg_prompt_ids
-        uncond_embeddings = self.text_encoder(uncond_input, params=params["text_encoder"])[0]
-        context = jnp.concatenate([uncond_embeddings, text_embeddings])
+            # get prompt text embeddings
+            with timer("before main loop 1"):
+                #text_embeddings = self.text_encoder(prompt_ids, params=params["text_encoder"])[0]
+                text_embeddings = _wrap_outside_a_text_encoder(prompt_ids)
 
-        latents_shape = (
-            batch_size,
-            self.unet.in_channels,
-            height // self.vae_scale_factor,
-            width // self.vae_scale_factor,
-        )
-        if latents is None:
-            latents = jax.random.normal(prng_seed, shape=latents_shape, dtype=jnp.float32)
-        else:
-            if latents.shape != latents_shape:
-                raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {latents_shape}")
+            # TODO: currently it is assumed `do_classifier_free_guidance = guidance_scale > 1.0`
+            # implement this conditional `do_classifier_free_guidance = guidance_scale > 1.0`
+            batch_size = prompt_ids.shape[0]
 
-        def loop_body(step, args):
-            latents, scheduler_state = args
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
-            # to avoid doing two forward passes
-            latents_input = jnp.concatenate([latents] * 2)
+            max_length = prompt_ids.shape[-1]
 
-            t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
-            timestep = jnp.broadcast_to(t, latents_input.shape[0])
+            with timer("before main loop 2"):
+                if neg_prompt_ids is None:
+                    uncond_input = self.tokenizer(
+                        [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="np"
+                    ).input_ids
+                else:
+                    uncond_input = neg_prompt_ids
 
-            latents_input = self.scheduler.scale_model_input(scheduler_state, latents_input, t)
+            with timer("before main loop 3"):
+                #uncond_embeddings = self.text_encoder(uncond_input, params=params["text_encoder"])[0]
+                uncond_embeddings = _wrap_outside_a_text_encoder(uncond_input)
 
-            # predict the noise residual
-            noise_pred = self.unet.apply(
-                {"params": params["unet"]},
-                jnp.array(latents_input),
-                jnp.array(timestep, dtype=jnp.int32),
-                encoder_hidden_states=context,
-            ).sample
-            # perform guidance
-            noise_pred_uncond, noise_prediction_text = jnp.split(noise_pred, 2, axis=0)
-            noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
+            with timer("before main loop 4"):
+                context = jnp.concatenate([uncond_embeddings, text_embeddings])
 
-            # compute the previous noisy sample x_t -> x_t-1
-            latents, scheduler_state = self.scheduler.step(scheduler_state, noise_pred, t, latents).to_tuple()
-            return latents, scheduler_state
+            latents_shape = (
+                batch_size,
+                self.unet.in_channels,
+                height // self.vae_scale_factor,
+                width // self.vae_scale_factor,
+            )
+            if latents is None:
+                latents = jax.random.normal(prng_seed, shape=latents_shape, dtype=jnp.float32)
+            else:
+                if latents.shape != latents_shape:
+                    raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {latents_shape}")
 
-        scheduler_state = self.scheduler.set_timesteps(
-            params["scheduler"], num_inference_steps=num_inference_steps, shape=latents.shape
-        )
+            scheduler_state = self.scheduler.set_timesteps(
+                params["scheduler"], num_inference_steps=num_inference_steps, shape=latents.shape
+            )
 
-        # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * params["scheduler"].init_noise_sigma
+            # scale the initial noise by the standard deviation required by the scheduler
+            latents = latents * params["scheduler"].init_noise_sigma
 
-        if DEBUG:
+            args = latents, scheduler_state, params, context, guidance_scale
+
+        if True:
             # run with python for loop
-            for i in range(num_inference_steps):
-                latents, scheduler_state = loop_body(i, (latents, scheduler_state))
+            with timer("main loop"):
+                for i in range(num_inference_steps):
+                    with timer(f"do iter {i}"):
+                        args = _wrap_outside_a_loop_body(i, args)
+            latents = args[0]
         else:
-            latents, _ = jax.lax.fori_loop(0, num_inference_steps, loop_body, (latents, scheduler_state))
+            # alpa + jax.lax.fori_loop? doesn't work..
+            with timer("do all iters with fori_loop"):
+                latents = jax.lax.fori_loop(0, num_inference_steps, _wrap_outside_a_loop_body, args)[0]
 
-        # scale and decode the image latents with vae
-        latents = 1 / 0.18215 * latents
-        image = self.vae.apply({"params": params["vae"]}, latents, method=self.vae.decode).sample
-
-        image = (image / 2 + 0.5).clip(0, 1).transpose(0, 2, 3, 1)
+        with timer("after main loop"):
+            # scale and decode the image latents with vae
+            latents = 1 / 0.18215 * jnp.array(latents)
+            if ray_enabled:
+                image = self.vae.apply({"params": params["vae"]}, latents, method=self.vae.decode).sample
+            else:
+                image = _wrap_outside_a_vae_apply(latents)
+                image = jnp.array(image)
+            image = (image / 2 + 0.5).clip(0, 1).transpose(0, 2, 3, 1)
+        
         return image
 
     def __call__(
@@ -286,6 +366,7 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
         neg_prompt_ids: jnp.array = None,
         return_dict: bool = True,
         jit: bool = False,
+        ray_enabled: bool = False,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -360,27 +441,12 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
                 guidance_scale,
                 latents,
                 neg_prompt_ids,
+                ray_enabled=ray_enabled,
             )
 
-        if self.safety_checker is not None:
-            safety_params = params["safety_checker"]
-            images_uint8_casted = (images * 255).round().astype("uint8")
-            num_devices, batch_size = images.shape[:2]
-
-            images_uint8_casted = np.asarray(images_uint8_casted).reshape(num_devices * batch_size, height, width, 3)
-            images_uint8_casted, has_nsfw_concept = self._run_safety_checker(images_uint8_casted, safety_params, jit)
-            images = np.asarray(images)
-
-            # block images
-            if any(has_nsfw_concept):
-                for i, is_nsfw in enumerate(has_nsfw_concept):
-                    if is_nsfw:
-                        images[i] = np.asarray(images_uint8_casted[i])
-
-            images = images.reshape(num_devices, batch_size, height, width, 3)
-        else:
-            images = np.asarray(images)
-            has_nsfw_concept = False
+        
+        images = np.asarray(images)
+        has_nsfw_concept = False
 
         if not return_dict:
             return (images, has_nsfw_concept)
@@ -430,3 +496,38 @@ def unshard(x: jnp.ndarray):
     num_devices, batch_size = x.shape[:2]
     rest = x.shape[2:]
     return x.reshape(num_devices * batch_size, *rest)
+
+@partial(alpa.parallelize, static_argnums=(2,))
+def _outside_a_text_encoder(state, batch, static_args):
+    pipeline = static_args["pipeline"]
+    prompt_ids = batch["prompt_ids"]
+
+    return pipeline.text_encoder(
+        prompt_ids,
+        params=state["text_encoder"]
+    )[0]
+
+@partial(alpa.parallelize, static_argnums=(2,))
+def _outside_a_loop_body(state, batch, static_args):
+    pipeline = static_args["pipeline"]
+    return pipeline.loop_body(
+        state["step"],
+        (
+            batch["latents"],
+            state["scheduler_state"],
+            {"unet": state["unet"]},
+            state["context"],
+            state["guidance_scale"]
+        )
+    )
+
+@partial(alpa.parallelize, static_argnums=(2,))
+def _outside_a_vae_apply(state, batch, static_args):
+    pipeline = static_args["pipeline"]
+    latents = batch["latents"]
+
+    return pipeline.vae.apply(
+        {"params":state["vae"]},
+        latents, 
+        method=pipeline.vae.decode
+    ).sample
