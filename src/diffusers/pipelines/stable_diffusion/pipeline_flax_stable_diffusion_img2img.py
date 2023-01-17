@@ -298,8 +298,7 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
         
         # main loop
         for i in range(start_timestep, num_inference_steps):
-            with timer(f"do iter {i}"):
-                args = _wrap_outside_a_loop_body(i, args)
+            args = _wrap_outside_a_loop_body(i, args)
         latents = jnp.array(args[0])
           
         # after main loop

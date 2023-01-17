@@ -289,10 +289,8 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
 
 
         # main loop
-        with timer("main loop"):
-            for i in range(num_inference_steps):
-                with timer(f"do iter {i}"):
-                    args = _wrap_outside_a_loop_body(i, args)
+        for i in range(num_inference_steps):
+            args = _wrap_outside_a_loop_body(i, args)
         latents = args[0]
 
         # after main loop

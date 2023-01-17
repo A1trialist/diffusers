@@ -3,9 +3,9 @@ import ray
 import jax
 import numpy as np
 import jax.numpy as jnp
+import requests
 from flax.jax_utils import replicate
 from flax.training.common_utils import shard
-import requests
 from io import BytesIO
 from PIL import Image
 from diffusers import FlaxStableDiffusionImg2ImgPipeline
@@ -13,7 +13,7 @@ from diffusers import FlaxStableDiffusionImg2ImgPipeline
 def create_key(seed=0):
     return jax.random.PRNGKey(seed)
 
-def run_alpa(pipeline, prompts, init_img, ray_enabled):
+def run_alpa(pipeline, params, prompts, init_img, ray_enabled):
 
     rng = create_key(0)
     
@@ -35,9 +35,9 @@ def run_alpa(pipeline, prompts, init_img, ray_enabled):
 
     output_images = pipeline.numpy_to_pil(np.asarray(output.images.reshape((num_samples,) + output.images.shape[-3:])))
 
-    output_images[0].save("/data/wly/po.png")
+    output_images[0].save("./output.png")
 
-ray_enabled = True
+ray_enabled = False
 
 if ray_enabled:
     ray.init()
@@ -61,5 +61,5 @@ pipeline, params = FlaxStableDiffusionImg2ImgPipeline.from_pretrained(
     dtype=jnp.bfloat16,
 )
 
-run_alpa(pipeline, prompts, init_img, ray_enabled)
-run_alpa(pipeline, prompts, init_img, ray_enabled)
+run_alpa(pipeline, params, prompts, init_img, ray_enabled)
+run_alpa(pipeline, params, prompts, init_img, ray_enabled)

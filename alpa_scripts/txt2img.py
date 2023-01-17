@@ -4,8 +4,6 @@ import jax
 import numpy as np
 import contextlib
 import time
-import contextlib
-import time
 
 from flax.jax_utils import replicate
 from flax.training.common_utils import shard
@@ -32,9 +30,9 @@ def run_alpa(pipeline, params, prompt):
     
     images = pipeline(prompt_ids, params, local_prng_seed, num_inference_steps, jit=False, ray_enabled=ray_enabled).images
     images = pipeline.numpy_to_pil(np.asarray(images.reshape((1,) + images.shape[-3:])))
-    images[0].save("/data/wly/po.png")
+    images[0].save("./output.png")
 
-ray_enabled = True
+ray_enabled = False
 
 if ray_enabled:
     ray.init()
@@ -52,5 +50,5 @@ pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
 
 prompt = "a photo of an astronaut riding a horse on mars"
 
-run_alpa(pipeline, prompt)
-run_alpa(pipeline, prompt)
+run_alpa(pipeline, params, prompt)
+run_alpa(pipeline, params, prompt)
