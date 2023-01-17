@@ -18,14 +18,14 @@
     ```bash
     python ./alpa_scripts/txt2img.py
     ```
-    You now should be able to see the generated picture `t2i_output.png`:
+    You should now be able to see the generated picture `t2i_output.png`:
     ![output_pic](../t2i_output.png)
 
     (b) Image to image:
     ```bash
     python ./alpa_scripts/img2img.py
     ```
-    You now should be able to see the generated picture `i2i_output.png`:
+    You should now be able to see the generated picture `i2i_output.png`:
     ![output_pic](../i2i_output.png)
 
 
