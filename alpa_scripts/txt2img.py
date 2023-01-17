@@ -30,7 +30,7 @@ def run_alpa(pipeline, params, prompt):
     
     images = pipeline(prompt_ids, params, local_prng_seed, num_inference_steps, jit=False, ray_enabled=ray_enabled).images
     images = pipeline.numpy_to_pil(np.asarray(images.reshape((1,) + images.shape[-3:])))
-    images[0].save("./output.png")
+    images[0].save("./t2i_output.png")
 
 ray_enabled = False
 

@@ -35,7 +35,7 @@ def run_alpa(pipeline, params, prompts, init_img, ray_enabled):
 
     output_images = pipeline.numpy_to_pil(np.asarray(output.images.reshape((num_samples,) + output.images.shape[-3:])))
 
-    output_images[0].save("./output.png")
+    output_images[0].save("./i2i_output.png")
 
 ray_enabled = False
 
